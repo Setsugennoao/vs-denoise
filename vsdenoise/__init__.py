@@ -6,8 +6,8 @@ from .ccd import *
 from .deblock import *
 from .fft import *
 from .freqs import *
-from .funcs import *
-from .limit import *
+#from .funcs import *
+#from .limit import *
 from .mvtools import *
 from .nlm import *
 from .postprocess import *

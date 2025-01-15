@@ -5,17 +5,16 @@ This module implements prefilters for denoisers
 from __future__ import annotations
 
 from enum import EnumMeta
-from math import ceil, sin
+from math import sin
 from typing import TYPE_CHECKING, Any, Literal, cast, overload
 
-from vsaa import Nnedi3
 from vsexprtools import ExprOp, complexpr_available, norm_expr
-from vskernels import Bicubic, Bilinear, Scaler, ScalerT
+from vskernels import Bilinear, Scaler, ScalerT
 from vsmasktools import retinex
 from vsrgtools import bilateral, blur, gauss_blur, min_blur
 from vstools import (
-    MISSING, ColorRange, ConvMode, CustomEnum, CustomIntEnum, CustomRuntimeError, MissingT, PlanesT, SingleOrArr,
-    SingleOrArrOpt, check_variable, clamp, core, depth, disallow_variable_format, disallow_variable_resolution,
+    MISSING, ColorRange, ConvMode, CustomIntEnum, MissingT, PlanesT, SingleOrArr,
+    SingleOrArrOpt, check_variable, clamp, core, depth,
     get_neutral_value, get_peak_value, get_y, join, normalize_planes, normalize_seq, scale_value, scale_delta, split, vs
 )
 
@@ -26,8 +25,7 @@ from .nlm import DeviceType, nl_means
 
 __all__ = [
     'Prefilter', 'prefilter_to_full_range',
-    'MultiPrefilter',
-    'PelType'
+    'MultiPrefilter'
 ]
 
 __abstract__ = [
@@ -890,140 +888,3 @@ def prefilter_to_full_range(pref: vs.VideoNode, range_conversion: float, planes:
         return join(pref_full, *chroma, family=pref.format.color_family)
 
     return pref_full
-
-
-if TYPE_CHECKING:
-    PelTypeBase = CustomEnum
-else:
-    class PelTypeBase(CustomEnum):
-        ...
-
-    class CUSTOM(Scaler):
-        def __init__(self, scaler: str | type[Scaler] | Scaler, **kwargs: Any) -> None:
-            self.scaler = Scaler.ensure_obj(scaler)
-            self.kwargs = kwargs
-
-        @disallow_variable_format
-        @disallow_variable_resolution
-        def __call__(
-            self, clip: vs.VideoNode, pel: int, subpixel: int = 3,
-            default: ScalerT | None = None, **kwargs: Any
-        ) -> vs.VideoNode:
-            return PelType.__call__(self.scaler, clip, pel, default, **(self.kwargs | kwargs))
-
-        def scale(
-            self, clip: vs.VideoNode, width: int | None = None, height: int | None = None,
-            shift: tuple[float, float] = (0, 0), **kwargs: Any
-        ) -> vs.VideoNode:
-            width, height = Scaler._wh_norm(clip, width, height)
-            return self.scaler.scale(clip, width, height, shift, **kwargs)
-
-        @property
-        def kernel_radius(self) -> int:
-            return self.scaler.kernel_radius
-
-    BILINEAR = CUSTOM(Bilinear)
-    BICUBIC = CUSTOM(Bicubic)
-    WIENER = CUSTOM(Bicubic(b=-0.6, c=0.4))
-
-    PelTypeBase.CUSTOM = CUSTOM
-    PelTypeBase.BILINEAR = BILINEAR
-    PelTypeBase.BICUBIC = BICUBIC
-    PelTypeBase.WIENER = WIENER
-
-
-class PelType(int, PelTypeBase):
-    AUTO = -1
-    """Automatically decide what :py:class:`PelType` to use."""
-
-    NONE = 0
-    """Don't perform any scaling."""
-
-    NNEDI3 = 4
-    """Performs scaling with NNedi3, ZNedi3."""
-
-    if TYPE_CHECKING:
-        from .prefilters import PelType
-
-        class CUSTOM(Scaler, PelType):  # type: ignore
-            """Class for constructing your own :py:class:`PelType`."""
-
-            def __init__(self, scaler: str | type[Scaler] | Scaler, **kwargs: Any) -> None:
-                """
-                Create custom :py:class`PelType` from a scaler.
-
-                :param scaler:  Scaler to be used for scaling and create a pel clip.
-                """
-
-            def scale(  # type: ignore
-                self, clip: vs.VideoNode, width: int | None = None, height: int | None = None,
-                shift: tuple[float, float] = (0, 0), **kwargs: Any
-            ) -> vs.VideoNode:
-                ...
-
-        BILINEAR: CUSTOM
-        """Performs scaling with the bilinear filter (:py:class:`vskernels.Bilinear`)."""
-
-        BICUBIC: CUSTOM
-        """Performs scaling with default bicubic values (:py:class:`vskernels.Catrom`)."""
-
-        WIENER: CUSTOM
-        """Performs scaling with the wiener filter (:py:class:`Bicubic(b=-0.6, c=0.4)`)."""
-
-        def __new__(cls, value: int) -> PelType:
-            ...
-
-        def __init__(self, value: int) -> None:
-            ...
-
-    @disallow_variable_format
-    @disallow_variable_resolution
-    def __call__(
-        pel_type: Scaler | PelType, clip: vs.VideoNode, pel: int,
-        default: ScalerT | PelType | None = None, **kwargs: Any
-    ) -> vs.VideoNode:
-        """
-        Scale a clip. Useful for motion interpolation.
-
-        :param clip:        Clip to be scaled.
-        :param pel:         Rate of scaling.
-        :param subpixel:    Precision used in mvtools calls.\n
-                            Will be used with :py:attr:`PelType.AUTO`.
-        :param default:     Specify a default :py:class:`PelType`/:py:class:`Scaler` top be used.\n
-                            Will be used with :py:attr:`PelType.AUTO`.
-        :param kwargs:      Keyword arguments passed to the scaler.
-
-        :return:            Upscaled clip.
-        """
-
-        assert clip.format
-
-        if pel_type is PelType.NONE or pel <= 1:
-            return clip
-
-        if pel_type is PelType.AUTO:
-            if default:
-                pel_type = default if isinstance(default, PelType) else Scaler.ensure_obj(default)
-            else:
-                val = 1 << 3 - ceil(clip.height / 1000)
-
-                if val < 1:
-                    pel_type = PelType.BILINEAR
-                elif val < 2:
-                    pel_type = PelType.BICUBIC
-                elif val < 3:
-                    pel_type = PelType.WIENER
-                else:
-                    pel_type = PelType.NNEDI3
-
-        if pel_type == PelType.NNEDI3:
-            if not any((hasattr(core, ns) for ns in ('nnedi3cl', 'nnedi3'))):
-                raise CustomRuntimeError('Missing any nnedi3 implementation!', PelType.NNEDI3)
-
-            kwargs |= {'nsize': 0, 'nns': clamp(((pel - 1) // 2) + 1, 0, 4), 'qual': clamp(pel - 1, 1, 3)} | kwargs
-
-            pel_type = Nnedi3(**kwargs)
-
-        assert isinstance(pel_type, Scaler)
-
-        return pel_type.scale(clip, clip.width * pel, clip.height * pel, **kwargs)
