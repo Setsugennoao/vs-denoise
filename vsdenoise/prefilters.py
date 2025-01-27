@@ -4,6 +4,8 @@ This module implements prefilters for denoisers
 
 from __future__ import annotations
 
+import warnings
+
 from enum import EnumMeta
 from math import ceil, sin
 from typing import TYPE_CHECKING, Any, Literal, cast, overload
@@ -12,11 +14,12 @@ from vsaa import Nnedi3
 from vsexprtools import ExprOp, complexpr_available, norm_expr
 from vskernels import Bicubic, Bilinear, Scaler, ScalerT
 from vsmasktools import retinex
-from vsrgtools import bilateral, box_blur, gauss_blur, min_blur
+from vsrgtools import bilateral, box_blur, flux_smooth, gauss_blur, min_blur
 from vstools import (
-    MISSING, ColorRange, ConvMode, CustomEnum, CustomIntEnum, CustomRuntimeError, MissingT, PlanesT, SingleOrArr,
-    SingleOrArrOpt, check_variable, clamp, core, depth, disallow_variable_format, disallow_variable_resolution,
-    get_neutral_value, get_peak_value, get_y, join, normalize_planes, normalize_seq, scale_value, scale_delta, split, vs
+    MISSING, ColorRange, ConvMode, CustomEnum, CustomIntEnum, CustomRuntimeError, MissingT, PlanesT,
+    SingleOrArr, SingleOrArrOpt, check_variable, clamp, core, depth, disallow_variable_format,
+    disallow_variable_resolution, get_neutral_value, get_peak_value, get_y, join, normalize_planes,
+    normalize_seq, scale_delta, scale_value, split, vs
 )
 
 from .bm3d import BM3D as BM3DM
@@ -62,40 +65,35 @@ class PrefilterBase(CustomIntEnum, metaclass=PrefilterMeta):
         def _run(clip: vs.VideoNode, planes: PlanesT, **kwargs: Any) -> vs.VideoNode:
             assert check_variable(clip, self)
 
-            pref_type = Prefilter.MINBLUR3 if self == Prefilter.AUTO else self
+            # TODO: to remove
+            if self == Prefilter.AUTO:
+                warnings.warn(
+                    f"{self} This Prefilter is deprecated and will be removed in a future version."
+                    "Use :py:attr:`MINBLUR(radius=3)` instead",
+                    DeprecationWarning
+                )
+                pref_type = Prefilter.MINBLUR
+                kwargs = dict(radius=3) | kwargs
+            else:
+                pref_type = self
 
-            peak = get_peak_value(clip)
             planes = normalize_planes(clip, planes)
 
             if pref_type == Prefilter.NONE:
                 return clip
 
-            if pref_type.value in {Prefilter.MINBLUR1, Prefilter.MINBLUR2, Prefilter.MINBLUR3}:
-                return min_blur(clip, int(pref_type._name_[-1]), planes=planes)
+            if pref_type == Prefilter.MINBLUR:
+                return min_blur(clip, **kwargs, planes=planes)
 
-            if pref_type == Prefilter.MINBLURFLUX:
-                temp_thr, spat_thr = kwargs.get('temp_thr', 2), kwargs.get('spat_thr', 2)
-                return min_blur(clip, 2, planes=planes).flux.SmoothST(  # type: ignore
-                    scale_delta(temp_thr, 8, clip),
-                    scale_delta(spat_thr, 8, clip),
-                    planes
-                )
+            if pref_type == Prefilter.GAUSS:
+                return gauss_blur(clip, kwargs.pop('sigma', 1.5), **kwargs, planes=planes)
 
-            if pref_type == Prefilter.DFTTEST_SMOOTH:
-                sigma = kwargs.get('sigma', 128.0)
-                sigma2 = kwargs.get('sigma2', sigma / 16)
-                sbsize = kwargs.get('sbsize', 8 if clip.width > 1280 else 6)
-                sosize = kwargs.get('sosize', 6 if clip.width > 1280 else 4)
-
-                kwargs |= dict(
-                    sbsize=sbsize, sosize=sosize, slocation=[
-                        0.0, sigma2, 0.05, sigma, 0.5, sigma, 0.75, sigma2, 1.0, 0.0
-                    ]
-                )
-
-                pref_type = Prefilter.DFTTEST
+            if pref_type == Prefilter.FLUXSMOOTHST:
+                temp_thr, spat_thr = kwargs.pop('temp_thr', 2), kwargs.pop('spat_thr', 2)
+                return flux_smooth(clip, temp_thr, spat_thr, **kwargs, planes=planes)
 
             if pref_type == Prefilter.DFTTEST:
+                peak = get_peak_value(clip)
                 dftt = DFTTest(sloc={0.0: 4, 0.2: 9, 1.0: 15}, tr=0).denoise(clip, **kwargs)
 
                 i, j = (scale_value(x, 8, clip) for x in (16, 75))
@@ -142,48 +140,6 @@ class PrefilterBase(CustomIntEnum, metaclass=PrefilterMeta):
 
                 return bm3d_arch.denoise(clip, **bm3d_args)
 
-            if pref_type == Prefilter.SCALEDBLUR:
-                scale = kwargs.pop('scale', 2)
-                downscaler = Scaler.ensure_obj(kwargs.pop('downscaler', Bilinear))
-                upscaler = downscaler.ensure_obj(kwargs.pop('upscaler', downscaler))
-
-                downscale = downscaler.scale(clip, clip.width // scale, clip.height // scale)
-
-                boxblur = box_blur(downscale, kwargs.pop('radius', 1), mode=kwargs.pop('mode', ConvMode.HV), planes=planes)
-
-                return upscaler.scale(boxblur, clip.width, clip.height)
-
-            if pref_type == Prefilter.GAUSS:
-                if 'sharp' not in kwargs and 'sigma' not in kwargs:
-                    kwargs |= dict(sigma=1.5)
-
-                return gauss_blur(clip, **(kwargs | dict[str, Any](planes=planes)))
-
-            if pref_type == Prefilter.GAUSSBLUR:
-                if 'sharp' not in kwargs and 'sigma' not in kwargs:
-                    kwargs |= dict(sigma=1.0)
-
-                return gauss_blur(clip, **(kwargs | dict[str, Any](planes=planes)))
-
-            if pref_type in {Prefilter.GAUSSBLUR1, Prefilter.GAUSSBLUR2}:
-                boxblur = box_blur(clip, kwargs.pop('radius', 1), mode=kwargs.get('mode', ConvMode.HV), planes=planes)
-
-                if 'sharp' not in kwargs and 'sigma' not in kwargs:
-                    kwargs |= dict(sigma=1.75)
-
-                strg = clamp(kwargs.pop('strength', 50 if pref_type == Prefilter.GAUSSBLUR2 else 90), 0, 98) + 1
-
-                gaussblur = gauss_blur(boxblur, **(kwargs | dict[str, Any](planes=planes)))
-
-                if pref_type == Prefilter.GAUSSBLUR2:
-                    i2, i7 = (scale_value(x, 8, clip) for x in (2, 7))
-
-                    merge_expr = f'x {i7} + y < x {i2} + x {i7} - y > x {i2} - x {strg} * y {100 - strg} * + 100 / ? ?'
-                else:
-                    merge_expr = f'x {strg / 100} * y {(100 - strg) / 100} * +'
-
-                return norm_expr([gaussblur, clip], merge_expr, planes)
-
             if pref_type is Prefilter.BILATERAL:
                 sigmaS = cast(float | list[float] | tuple[float | list[float], ...], kwargs.pop('sigmaS', 3.0))
                 sigmaR = cast(float | list[float] | tuple[float | list[float], ...], kwargs.pop('sigmaR', 0.02))
@@ -210,7 +166,89 @@ class PrefilterBase(CustomIntEnum, metaclass=PrefilterMeta):
 
                 return bilateral(clip, baseS, baseR, ref, **kwargs)
 
+            # TODO: To remove
+            if pref_type.value in {Prefilter.MINBLUR1, Prefilter.MINBLUR2, Prefilter.MINBLUR3}:
+                warnings.warn(
+                    f"{pref_type} This Prefilter is deprecated and will be removed in a future version."
+                    "Use :py:attr:`MINBLUR(radius=...)` instead",
+                    DeprecationWarning
+                )
+                return Prefilter.MINBLUR(clip, planes, full_range, radius=int(pref_type._name_[-1]))
+
+            # TODO: To remove
+            if pref_type == Prefilter.MINBLURFLUX:
+                warnings.warn(
+                    f"{pref_type} This Prefilter is deprecated and will be removed in a future version."
+                    "Use :py:attr:`FLUXSMOOTHST(...)` instead",
+                    DeprecationWarning
+                )
+                temp_thr, spat_thr = kwargs.get('temp_thr', 2), kwargs.get('spat_thr', 2)
+                return min_blur(clip, 2, planes=planes).flux.SmoothST(  # type: ignore
+                    scale_delta(temp_thr, 8, clip),
+                    scale_delta(spat_thr, 8, clip),
+                    planes
+                )
+
+            # TODO: To remove
+            if pref_type == Prefilter.SCALEDBLUR:
+                warnings.warn(
+                    f"{pref_type} This Prefilter is deprecated and will be removed in a future version."
+                    "Use :py:attr:`GAUSS(...)` instead",
+                    DeprecationWarning
+                )
+                scale = kwargs.pop('scale', 2)
+                downscaler = Scaler.ensure_obj(kwargs.pop('downscaler', Bilinear))
+                upscaler = downscaler.ensure_obj(kwargs.pop('upscaler', downscaler))
+
+                downscale = downscaler.scale(clip, clip.width // scale, clip.height // scale)
+
+                boxblur = box_blur(downscale, kwargs.pop('radius', 1), mode=kwargs.pop('mode', ConvMode.HV), planes=planes)
+
+                return upscaler.scale(boxblur, clip.width, clip.height)
+
+            # TODO: To remove
+            if pref_type == Prefilter.GAUSSBLUR:
+                warnings.warn(
+                    f"{pref_type} This Prefilter is deprecated and will be removed in a future version."
+                    "Use :py:attr:`GAUSS(...)` instead",
+                    DeprecationWarning
+                )
+                if 'sharp' not in kwargs and 'sigma' not in kwargs:
+                    kwargs |= dict(sigma=1.0)
+
+                return gauss_blur(clip, **(kwargs | dict[str, Any](planes=planes)))
+
+            # TODO: To remove
+            if pref_type in {Prefilter.GAUSSBLUR1, Prefilter.GAUSSBLUR2}:
+                warnings.warn(
+                    f"{pref_type} This Prefilter is deprecated and will be removed in a future version."
+                    "Use :py:attr:`GAUSS(...)` instead",
+                    DeprecationWarning
+                )
+                boxblur = box_blur(clip, kwargs.pop('radius', 1), mode=kwargs.get('mode', ConvMode.HV), planes=planes)
+
+                if 'sharp' not in kwargs and 'sigma' not in kwargs:
+                    kwargs |= dict(sigma=1.75)
+
+                strg = clamp(kwargs.pop('strength', 50 if pref_type == Prefilter.GAUSSBLUR2 else 90), 0, 98) + 1
+
+                gaussblur = gauss_blur(boxblur, **(kwargs | dict[str, Any](planes=planes)))
+
+                if pref_type == Prefilter.GAUSSBLUR2:
+                    i2, i7 = (scale_value(x, 8, clip) for x in (2, 7))
+
+                    merge_expr = f'x {i7} + y < x {i2} + x {i7} - y > x {i2} - x {strg} * y {100 - strg} * + 100 / ? ?'
+                else:
+                    merge_expr = f'x {strg / 100} * y {(100 - strg) / 100} * +'
+
+                return norm_expr([gaussblur, clip], merge_expr, planes)
+
+            # TODO: To remove
             if pref_type is Prefilter.BMLATERAL:
+                warnings.warn(
+                    f"{pref_type} This Prefilter is deprecated and will be removed in a future version.",
+                    DeprecationWarning
+                )
                 sigma = kwargs.pop('sigma', 1.5)
                 tr = kwargs.pop('tr', 2)
                 radius = kwargs.pop('radius', 7)
@@ -221,6 +259,33 @@ class PrefilterBase(CustomIntEnum, metaclass=PrefilterMeta):
                 )
 
                 return Prefilter.BILATERAL(den, planes, sigmaS=[sigma, sigma / 3], sigmaR=radius / 255)
+
+            # TODO: To remove
+            if pref_type == Prefilter.DFTTEST_SMOOTH:
+                warnings.warn(
+                    f"{pref_type} This Prefilter is deprecated and will be removed in a future version.\n"
+                    "    Use this instead:\n"
+                    "    sigma = 128\n"
+                    "    sigma2 = sigma / 16\n"
+                    "    DFTTEST(\n"
+                    "        sbsize=8 if clip.width > 1280 else 6,\n"
+                    "        sosize=6 if clip.width > 1280 else 4,\n"
+                    "        slocation=[0.0, sigma2, 0.05, sigma, 0.5, sigma, 0.75, sigma2, 1.0, 0.0]\n"
+                    "    )",
+                    DeprecationWarning
+                )
+                sigma = kwargs.get('sigma', 128.0)
+                sigma2 = kwargs.get('sigma2', sigma / 16)
+                sbsize = kwargs.get('sbsize', 8 if clip.width > 1280 else 6)
+                sosize = kwargs.get('sosize', 6 if clip.width > 1280 else 4)
+
+                kwargs |= dict(
+                    sbsize=sbsize, sosize=sosize, slocation=[
+                        0.0, sigma2, 0.05, sigma, 0.5, sigma, 0.75, sigma2, 1.0, 0.0
+                    ]
+                )
+
+                return Prefilter.DFTTEST(clip, planes, **kwargs)
 
             return clip
 
@@ -245,29 +310,20 @@ class Prefilter(PrefilterBase):
     but can be used standalone as-is.
     """
 
-    AUTO = -2
-    """Automatically decide what prefilter to use."""
-
     NONE = -1
     """Don't do any prefiltering. Returns the clip as-is."""
 
-    MINBLUR1 = 0
-    """Minimum difference of a gaussian/median blur with a radius of 1."""
+    MINBLUR = 15
+    """Minimum difference of a gaussian/median blur"""
 
-    MINBLUR2 = 1
-    """Minimum difference of a gaussian/median blur with a radius of 2."""
+    GAUSS = 13
+    """Gaussian blur."""
 
-    MINBLUR3 = 2
-    """Minimum difference of a gaussian/median blur with a radius of 3."""
-
-    MINBLURFLUX = 3
-    """:py:attr:`MINBLUR2` with temporal/spatial average."""
+    FLUXSMOOTHST = 16
+    """Perform smoothing using `zsmooth.FluxSmoothST`"""
 
     DFTTEST = 4
     """Denoising in frequency domain with dfttest and an adaptive mask for retaining lineart."""
-
-    DFTTEST_SMOOTH = 12
-    """Denoising like in DFTTEST but with high defaults for lower frequencies."""
 
     NLMEANS = 5
     """Denoising with NLMeans."""
@@ -275,38 +331,107 @@ class Prefilter(PrefilterBase):
     BM3D = 6
     """Normal spatio-temporal denoising using BM3D."""
 
-    SCALEDBLUR = 7
-    """Perform blurring at a scaled-down resolution, then scaled back up."""
-
-    GAUSS = 13
-    """Gaussian blur."""
-
-    GAUSSBLUR = 8
-    """Gaussian blurred."""
-
-    GAUSSBLUR1 = 9
-    """Clamped gaussian/box blurring."""
-
-    GAUSSBLUR2 = 10
-    """Clamped gaussian/box blurring with edge preservation."""
-
     BILATERAL = 11
     """Classic bilateral filtering or edge-preserving bilateral multi pass filtering."""
 
+    # TODO: To remove
+    AUTO = -2
+    """
+    Automatically decide what prefilter to use.
+    This enum is deprecated and will be removed in a future version.
+    Use :py:attr:`MINBLUR(radius=3)` instead
+    """
+
+    MINBLUR1 = 0
+    """
+    Minimum difference of a gaussian/median blur with a radius of 1.
+    This enum is deprecated and will be removed in a future version.
+    Use :py:attr:`MINBLUR(radius=1)` instead
+    """
+
+    MINBLUR2 = 1
+    """
+    Minimum difference of a gaussian/median blur with a radius of 2.
+    This enum is deprecated and will be removed in a future version.
+    Use :py:attr:`MINBLUR(radius=2)` instead.
+    """
+
+    MINBLUR3 = 2
+    """
+    Minimum difference of a gaussian/median blur with a radius of 3.
+    This enum is deprecated and will be removed in a future version.
+    Use :py:attr:`MINBLUR(radius=3)` instead.
+    """
+
+    MINBLURFLUX = 3
+    """
+    :py:attr:`MINBLUR2` with temporal/spatial average.
+    This enum is deprecated and will be removed in a future version.
+    Use :py:attr:`FLUXSMOOTHST(...)` instead.
+    """
+
+    SCALEDBLUR = 7
+    """
+    Perform blurring at a scaled-down resolution, then scaled back up.
+    This enum is deprecated and will be removed in a future version.
+    Use :py:attr:`GAUSS()` instead.
+    """
+
+    GAUSSBLUR = 8
+    """
+    Gaussian blurred.
+    This enum is deprecated and will be removed in a future version.
+    Use :py:attr:`GAUSS()` instead.
+    """
+
+    GAUSSBLUR1 = 9
+    """
+    Clamped gaussian/box blurring.
+    This enum is deprecated and will be removed in a future version.
+    Use :py:attr:`GAUSS()` instead.
+    """
+
+    GAUSSBLUR2 = 10
+    """
+    Clamped gaussian/box blurring with edge preservation.
+    This enum is deprecated and will be removed in a future version.
+    Use :py:attr:`GAUSS()` instead.
+    """
+
     BMLATERAL = 14
-    """BM3D + BILATERAL blurring."""
+    """
+    BM3D + BILATERAL blurring.
+    This enum is deprecated and will be removed in a future version.
+    """
+
+    DFTTEST_SMOOTH = 12
+    """
+    Denoising like in DFTTEST but with high defaults for lower frequencies.
+    This enum is deprecated and will be removed in a future version.
+    Use this instead:
+    ```py
+    sigma = 128
+    sigma2 = sigma / 16
+
+    DFTTEST(
+        sbsize=8 if clip.width > 1280 else 6,
+        sosize=6 if clip.width > 1280 else 4,
+        slocation=[0.0, sigma2, 0.05, sigma, 0.5, sigma, 0.75, sigma2, 1.0, 0.0]
+    )
+    ```
+    """
 
     if TYPE_CHECKING:
         from .prefilters import Prefilter
 
         @overload  # type: ignore
         def __call__(
-            self: Literal[Prefilter.MINBLURFLUX], clip: vs.VideoNode, /,
+            self: Literal[Prefilter.FLUXSMOOTHST], clip: vs.VideoNode, /,
             planes: PlanesT = None, full_range: bool | float = False,
             *, temp_thr: int = 2, spat_thr: int = 2
         ) -> vs.VideoNode:
             """
-            :py:attr:`MINBLUR2` with temporal/spatial average.
+            Perform smoothing using `zsmooth.FluxSmoothST`
 
             :param clip:        Clip to be preprocessed.
             :param planes:      Planes to be preprocessed.
@@ -336,22 +461,13 @@ class Prefilter(PrefilterBase):
 
         @overload
         def __call__(  # type: ignore
-            self: Literal[Prefilter.DFTTEST_SMOOTH], clip: vs.VideoNode, /,
-            planes: PlanesT = None, full_range: bool | float = False, *,
-            sigma: float = 128.0, sigma2: float | None = None, sbsize: int | None = None, sosize: int | None = None,
-            **kwargs: Any
-        ) -> vs.VideoNode:
-            ...
-
-        @overload
-        def __call__(  # type: ignore
             self: Literal[Prefilter.NLMEANS], clip: vs.VideoNode, /,
             planes: PlanesT = None, full_range: bool | float = False, *,
             strength: SingleOrArr[float] = 7.0, tr: SingleOrArr[int] = 1, sr: SingleOrArr[int] = 2,
             simr: SingleOrArr[int] = 2, device_type: DeviceType = DeviceType.AUTO, **kwargs: Any
         ) -> vs.VideoNode:
             """
-            Denoising with NLMeans, then postprocessed to restore low frequencies.
+            Denoising with NLMeans.
 
             :param clip:            Source clip.
             :param strength:        Controls the strength of the filtering.\n
@@ -401,98 +517,6 @@ class Prefilter(PrefilterBase):
 
         @overload
         def __call__(  # type: ignore
-            self: Literal[Prefilter.SCALEDBLUR], clip: vs.VideoNode, /,
-            planes: PlanesT = None, full_range: bool | float = False, *,
-            scale: int = 2, radius: int = 1, mode: ConvMode = ConvMode.HV,
-            downscaler: ScalerT = Bilinear, upscaler: ScalerT | None = None
-        ) -> vs.VideoNode:
-            """
-            Perform blurring at a scaled-down resolution, then scaled back up.
-
-            :param clip:        Clip to be preprocessed.
-            :param planes:      Planes to be preprocessed.
-            :param full_range:  Whether to return a prefiltered clip in full range.
-            :param scale:       Ratios for downscaling.
-                                A ratio of 2 will divide the resolution by 2, 4 by 4, etc.
-            :param radius:      :py:attr:`vsrgtools.blur` radius param.
-            :param mode:        Convolution mode for blurring.
-            :param downscaler:  Scaler to be used for downscaling.
-            :param upscaler:    Scaler to be used for reupscaling.\n
-                                If None, :py:attr:`downscaler` will be used.
-
-            :return:            Preprocessed clip.
-            """
-
-        @overload
-        def __call__(  # type: ignore
-            self: Literal[Prefilter.GAUSSBLUR], clip: vs.VideoNode, /,
-            planes: PlanesT = None, full_range: bool | float = False, *,
-            sigma: float | None = 1.0, sharp: float | None = None, mode: ConvMode = ConvMode.HV
-        ) -> vs.VideoNode:
-            """
-            Gaussian blurred, then postprocessed to restore low frequencies.
-
-            :param clip:        Clip to be preprocessed.
-            :param planes:      Planes to be preprocessed.
-            :param full_range:  Whether to return a prefiltered clip in full range.
-            :param sigma:       Sigma param for :py:attr:`vsrgtools.gauss_blur`.
-            :param sharp:       Sharp param for :py:attr:`vsrgtools.gauss_blur`.\n
-                                Either :py:attr:`sigma` or this should be specified.
-            :param mode:        Convolution mode for blurring.
-
-            :return:            Preprocessed clip.
-            """
-
-        @overload
-        def __call__(  # type: ignore
-            self: Literal[Prefilter.GAUSSBLUR1], clip: vs.VideoNode, /,
-            planes: PlanesT = None, full_range: bool | float = False, *,
-            radius: int = 1, strength: int = 90, sigma: float | None = 1.75,
-            sharp: float | None = None, mode: ConvMode = ConvMode.HV
-        ) -> vs.VideoNode:
-            """
-            Clamped gaussian/box blurring with edge preservation.
-
-            :param clip:        Clip to be preprocessed.
-            :param planes:      Planes to be preprocessed.
-            :param full_range:  Whether to return a prefiltered clip in full range.
-            :param radius:      Radius param for the blurring.
-            :param strength:    Clamping strength between the two blurred clips.\n
-                                Must be between 1 and 99 (inclusive).
-            :param sigma:       Sigma param for :py:attr:`vsrgtools.gauss_blur`.
-            :param sharp:       Sharp param for :py:attr:`vsrgtools.gauss_blur`.\n
-                                Either :py:attr:`sigma` or this should be specified.
-            :param mode:        Convolution mode for blurring.
-
-            :return:            Preprocessed clip.
-            """
-
-        @overload
-        def __call__(  # type: ignore
-            self: Literal[Prefilter.GAUSSBLUR2], clip: vs.VideoNode, /,
-            planes: PlanesT = None, full_range: bool | float = False, *,
-            radius: int = 1, strength: int = 50, sigma: float | None = 1.75,
-            sharp: float | None = None, mode: ConvMode = ConvMode.HV
-        ) -> vs.VideoNode:
-            """
-            Clamped gaussian/box blurring.
-
-            :param clip:        Clip to be preprocessed.
-            :param planes:      Planes to be preprocessed.
-            :param full_range:  Whether to return a prefiltered clip in full range.
-            :param radius:      Radius param for the blurring.
-            :param strength:    Edge detection strength.\n
-                                Must be between 1 and 99 (inclusive).
-            :param sigma:       Sigma param for :py:attr:`vsrgtools.gauss_blur`.
-            :param sharp:       Sharp param for :py:attr:`vsrgtools.gauss_blur`.\n
-                                Either :py:attr:`sigma` or this should be specified.
-            :param mode:        Convolution mode for blurring.
-
-            :return:            Preprocessed clip.
-            """
-
-        @overload
-        def __call__(  # type: ignore
             self: Literal[Prefilter.BILATERAL], clip: vs.VideoNode, /,
             planes: PlanesT = None, full_range: bool | float = False, *,
             sigmaS: float | list[float] | tuple[float | list[float], ...] = 3.0,
@@ -515,27 +539,6 @@ class Prefilter(PrefilterBase):
             """
 
         @overload
-        def __call__(  # type: ignore
-            self: Literal[Prefilter.BMLATERAL], clip: vs.VideoNode, /,
-            planes: PlanesT = None, full_range: bool | float = False, *,
-            sigma: float = 1.5, radius: float = 7, tr: int = 2, gpu: bool | None = None, **kwargs: Any
-        ) -> vs.VideoNode:
-            """
-            BM3D + BILATERAL smoothing.
-
-            :param clip:        Clip to be preprocessed.
-            :param planes:      Planes to be preprocessed.
-            :param full_range:  Whether to return a prefiltered clip in full range.
-            :param sigma:       ``Bilateral`` spatial weight sigma.
-            :param radius:      ``Bilateral`` radius weight sigma.
-            :param tr:          Temporal radius for BM3D.
-            :param gpu:         Whether to process with GPU or not. None is auto.
-            :param **kwargs:    Kwargs passed to BM3D.
-
-            :return:            Partial Prefilter.
-            """
-
-        @overload
         def __call__(
             self, clip: vs.VideoNode, /, planes: PlanesT = None, full_range: bool | float = False, **kwargs: Any
         ) -> vs.VideoNode:
@@ -552,11 +555,11 @@ class Prefilter(PrefilterBase):
 
         @overload  # type: ignore
         def __call__(
-            self: Literal[Prefilter.MINBLURFLUX], *,
+            self: Literal[Prefilter.FLUXSMOOTHST], *,
             planes: PlanesT = None, full_range: bool | float = False, temp_thr: int = 2, spat_thr: int = 2
         ) -> PrefilterPartial:
             """
-            :py:attr:`MINBLUR2` with temporal/spatial average.
+            Perform smoothing using `zsmooth.FluxSmoothST`
 
             :param planes:      Planes to be preprocessed.
             :param full_range:  Whether to return a prefiltered clip in full range.
@@ -578,14 +581,6 @@ class Prefilter(PrefilterBase):
             f0beta: float | None = None, nlocation: SingleOrArrOpt[int] = None, alpha: float | None = None,
             ssx: SingleOrArrOpt[float] = None, ssy: SingleOrArrOpt[float] = None, sst: SingleOrArrOpt[float] = None,
             ssystem: int | None = None, opt: int | None = None
-        ) -> PrefilterPartial:
-            ...
-
-        @overload
-        def __call__(  # type: ignore
-            self: Literal[Prefilter.DFTTEST_SMOOTH], *, planes: PlanesT = None, full_range: bool | float = False,
-            sigma: float = 128.0, sigma2: float | None = None, sbsize: int | None = None, sosize: int | None = None,
-            **kwargs: Any
         ) -> PrefilterPartial:
             ...
 
@@ -637,90 +632,6 @@ class Prefilter(PrefilterBase):
                                 * 0 means basic estimate only.
                                 * 1 means basic estimate with one final estimate.
                                 * n means basic estimate refined with final estimate for n times.
-
-            :return:            Partial Prefilter.
-            """
-
-        @overload
-        def __call__(  # type: ignore
-            self: Literal[Prefilter.SCALEDBLUR], *, planes: PlanesT = None, full_range: bool | float = False,
-            scale: int = 2, radius: int = 1, mode: ConvMode = ConvMode.HV,
-            downscaler: ScalerT = Bilinear, upscaler: ScalerT | None = None
-        ) -> PrefilterPartial:
-            """
-            Perform blurring at a scaled-down resolution, then scaled back up.
-
-            :param planes:      Planes to be preprocessed.
-            :param full_range:  Whether to return a prefiltered clip in full range.
-            :param scale:       Ratios for downscaling.
-                                A ratio of 2 will divide the resolution by 2, 4 by 4, etc.
-            :param radius:      :py:attr:`vsrgtools.blur` radius param.
-            :param mode:        Convolution mode for blurring.
-            :param downscaler:  Scaler to be used for downscaling.
-            :param upscaler:    Scaler to be used for reupscaling.\n
-                                If None, :py:attr:`downscaler` will be used.
-
-            :return:            Partial Prefilter.
-            """
-
-        @overload
-        def __call__(  # type: ignore
-            self: Literal[Prefilter.GAUSSBLUR], *, planes: PlanesT = None, full_range: bool | float = False,
-            sigma: float | None = 1.0, sharp: float | None = None, mode: ConvMode = ConvMode.HV
-        ) -> PrefilterPartial:
-            """
-            Gaussian blurred, then postprocessed to restore low frequencies.
-
-            :param planes:      Planes to be preprocessed.
-            :param full_range:  Whether to return a prefiltered clip in full range.
-            :param sigma:       Sigma param for :py:attr:`vsrgtools.gauss_blur`.
-            :param sharp:       Sharp param for :py:attr:`vsrgtools.gauss_blur`.\n
-                                Either :py:attr:`sigma` or this should be specified.
-            :param mode:        Convolution mode for blurring.
-
-            :return:            Partial Prefilter.
-            """
-
-        @overload
-        def __call__(  # type: ignore
-            self: Literal[Prefilter.GAUSSBLUR1], *, planes: PlanesT = None, full_range: bool | float = False,
-            radius: int = 1, strength: int = 90, sigma: float | None = 1.75,
-            sharp: float | None = None, mode: ConvMode = ConvMode.HV
-        ) -> PrefilterPartial:
-            """
-            Clamped gaussian/box blurring with edge preservation.
-
-            :param planes:      Planes to be preprocessed.
-            :param full_range:  Whether to return a prefiltered clip in full range.
-            :param radius:      Radius param for the blurring.
-            :param strength:    Clamping strength between the two blurred clips.\n
-                                Must be between 1 and 99 (inclusive).
-            :param sigma:       Sigma param for :py:attr:`vsrgtools.gauss_blur`.
-            :param sharp:       Sharp param for :py:attr:`vsrgtools.gauss_blur`.\n
-                                Either :py:attr:`sigma` or this should be specified.
-            :param mode:        Convolution mode for blurring.
-
-            :return:            Partial Prefilter.
-            """
-
-        @overload
-        def __call__(  # type: ignore
-            self: Literal[Prefilter.GAUSSBLUR2], *, planes: PlanesT = None, full_range: bool | float = False,
-            radius: int = 1, strength: int = 50, sigma: float | None = 1.75,
-            sharp: float | None = None, mode: ConvMode = ConvMode.HV
-        ) -> PrefilterPartial:
-            """
-            Clamped gaussian/box blurring.
-
-            :param planes:      Planes to be preprocessed.
-            :param full_range:  Whether to return a prefiltered clip in full range.
-            :param radius:      Radius param for the blurring.
-            :param strength:    Edge detection strength.\n
-                                Must be between 1 and 99 (inclusive).
-            :param sigma:       Sigma param for :py:attr:`vsrgtools.gauss_blur`.
-            :param sharp:       Sharp param for :py:attr:`vsrgtools.gauss_blur`.\n
-                                Either :py:attr:`sigma` or this should be specified.
-            :param mode:        Convolution mode for blurring.
 
             :return:            Partial Prefilter.
             """
